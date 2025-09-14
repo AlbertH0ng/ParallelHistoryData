@@ -20,21 +20,20 @@ raw_data_path = "/Users/antinghong/quantclass-data-folder/coin-binance-spot-swap
 processed_data_path = "/Users/antinghong/Documents/LocalCode/ParallelHistoryData/Output" # 输出路径
 
 # Custom generation configuration
-GENERATION_MODES = ['GBM_Gravity', 'GARCH', 'GARCH-Generate', 'Anomaly_Injection'] # 生成模式 # 'GBM_Gravity', 'GARCH', 
+GENERATION_MODES = ['GBM_Gravity', 'GARCH', 'Anomaly_Injection'] # 生成模式 # 'GBM_Gravity', 'GARCH',
 GENERATION_COUNT = 1  # 每个模式生成世界数量
 RANDOM_SEED = None  # 随机种子，设置为None则每次运行生成不同的世界
 
 CUSTOM_PARAMETERS = {
     'GBM_Gravity': {
-        'sigma_scale': 0.8, # 波动率系数
-        'G': 0.8 # 引力系数
+        'sigma_scale': 1.0, # 波动率系数
+        'G': 0.6, # 引力系数
+        'drift_scale': 1.0 # 漂移率缩放系数
     },
     'GARCH': {
-        'sigma_scale': 1.0 # 波动率系数
-    },
-    'GARCH-Generate': {
-        'drift_scale': 1.0, # 漂移率缩放系数
-        'vol_scale': 1.0, # 波动率缩放系数
+        'sigma_scale': 1.0, # 波动率系数
+        'G': 0.0, # 引力系数: 1.0=纯原始价格修改, 0.0=纯生成新价格, 0.5=混合
+        'drift_scale': 1.0 # 漂移率缩放系数
     },
     'Anomaly_Injection': {
         'anomaly_prob': 0.02, # 异常概率
@@ -156,7 +155,7 @@ def apply_gbm_gravity_noise(df, symbol=None, **kwargs):
             for t in range(1, len(df)):
                 if pd.notna(df[col].iloc[t-1]) and pd.notna(orig_prices[col].iloc[t]):
                     
-                    drift = mu * df[col].iloc[t-1]  # 漂移项
+                    drift = mu * df[col].iloc[t-1] * params['drift_scale']  # 漂移项
                     diffusion = sigma * df[col].iloc[t-1] * dW[t]  # 扩散项
                     # 引力项：拉向原始价格
                     gravity = params['G'] * (orig_prices[col].iloc[t] - df[col].iloc[t-1])
@@ -169,14 +168,47 @@ def apply_gbm_gravity_noise(df, symbol=None, **kwargs):
     df['low'] = np.minimum(df['low'], df[['open', 'close']].min(axis=1))
     return adjust_linked_fields(df)
 
-# GARCH-based noise
+# GARCH-based noise with G parameter for mixing original and generated prices
 def apply_garch_noise(df, symbol=None, **kwargs):
     params = CUSTOM_PARAMETERS['GARCH']
     params.update(kwargs)
-    
+
     df = df.copy()
+    G = params['G']  # Gravity parameter: 1.0=original GARCH, 0.0=full generation, 0.5=mixed
+
+    if G >= 1.0:
+        # Pure original GARCH behavior - modify existing prices
+        return _apply_original_garch_logic(df, symbol, params)
+    elif G <= 0.0:
+        # Pure generation behavior
+        return _apply_garch_generation_logic(df, symbol, params)
+    else:
+        # Mixed approach: blend original modification with generation
+        # Apply original GARCH modification
+        modified_df = _apply_original_garch_logic(df.copy(), symbol, params)
+
+        # Apply GARCH generation
+        generated_df = _apply_garch_generation_logic(df.copy(), symbol, params)
+
+        # Blend the results based on G parameter
+        prices = ['open', 'close', 'high', 'low']
+        for col in prices:
+            if col in df.columns:
+                # G closer to 1: more weight to modified original prices
+                # G closer to 0: more weight to generated prices
+                df[col] = G * modified_df[col] + (1 - G) * generated_df[col]
+                df[col] = np.maximum(df[col], 1e-8)
+
+        # Ensure OHLC constraints
+        df['high'] = np.maximum(df['high'], df[['open', 'close']].max(axis=1))
+        df['low'] = np.minimum(df['low'], df[['open', 'close']].min(axis=1))
+
+        return adjust_linked_fields(df)
+
+def _apply_original_garch_logic(df, symbol, params):
+    """Original GARCH modification logic"""
     prices = ['open', 'close', 'high', 'low']
-    
+
     for col in prices:
         if col in df.columns:
             returns = df[col].pct_change().dropna()
@@ -185,11 +217,11 @@ def apply_garch_noise(df, symbol=None, **kwargs):
                     model = arch_model(returns * 100, vol='Garch', p=1, q=1, rescale=False)
                     res = model.fit(disp='off', show_warning=False)
                     vol = res.conditional_volatility / 100  # Scale back
-                    
+
                     # Apply GARCH-based noise
                     noise = np.random.normal(0, 1, len(vol))
                     price_changes = vol * noise * params['sigma_scale']
-                    
+
                     # Apply to prices (skip first value due to pct_change)
                     for i in range(1, len(df)):
                         if i-1 < len(price_changes):
@@ -213,16 +245,10 @@ def apply_garch_noise(df, symbol=None, **kwargs):
     # Ensure OHLC constraints
     df['high'] = np.maximum(df['high'], df[['open', 'close']].max(axis=1))
     df['low'] = np.minimum(df['low'], df[['open', 'close']].min(axis=1))
-    return adjust_linked_fields(df)
+    return df
 
-# GARCH-based full price generation
-def apply_garch_generate_noise(df, symbol=None, **kwargs):
-    """Generate entirely new price series using GARCH model based on original price features"""
-    params = CUSTOM_PARAMETERS['GARCH-Generate']
-    params.update(kwargs)
-
-    df = df.copy()
-
+def _apply_garch_generation_logic(df, symbol, params):
+    """GARCH generation logic (adapted from GARCH-Generate)"""
     # Work with close prices first (most important for GARCH modeling)
     if 'close' not in df.columns or len(df) < 50:
         symbol_info = f" for {symbol}" if symbol else ""
@@ -267,7 +293,7 @@ def apply_garch_generate_noise(df, symbol=None, **kwargs):
                 vol_t = np.sqrt(max(vol_t_squared, 1e-8))
 
             # Scale volatility
-            vol_t *= params['vol_scale']
+            vol_t *= params['sigma_scale']
 
             # Generate new return
             epsilon = np.random.normal(0, 1)
@@ -278,7 +304,7 @@ def apply_garch_generate_noise(df, symbol=None, **kwargs):
 
         # Generate new price series starting from original first price
         new_close_prices = [original_close.iloc[0]]
-        for i, ret in enumerate(new_returns):
+        for ret in new_returns:
             new_price = new_close_prices[-1] * (1 + ret)
             new_close_prices.append(max(new_price, 1e-8))
 
@@ -293,10 +319,6 @@ def apply_garch_generate_noise(df, symbol=None, **kwargs):
         prices = ['open', 'high', 'low']
         for col in prices:
             if col in df.columns:
-                # Calculate original price ratios relative to close
-                original_ratios = df[col] / (df['close'] + 1e-8)
-                original_ratios = original_ratios.fillna(1.0)
-
                 if col == 'open':
                     # Open prices: use previous close with some noise
                     df.loc[df.index[1:], 'open'] = df['close'].shift(1).iloc[1:] * (1 + np.random.normal(0, 0.002, len(df) - 1))
@@ -319,15 +341,13 @@ def apply_garch_generate_noise(df, symbol=None, **kwargs):
         df['high'] = np.maximum(df['high'], df[['open', 'close']].max(axis=1))
         df['low'] = np.minimum(df['low'], df[['open', 'close']].min(axis=1))
 
-        symbol_info = f" for {symbol}" if symbol else ""
-        # print(f"Successfully generated new GARCH-based price series{symbol_info}")
-
     except Exception as e:
         symbol_info = f" for {symbol}" if symbol else ""
         print(f"GARCH generation failed{symbol_info}: {str(e)}, using original data")
         return df
 
-    return adjust_linked_fields(df)
+    return df
+
 
 # Improved anomaly injection with VaR-based scaling and gradual recovery
 def apply_anomaly_injection_noise(df, symbol_var_dict, symbol, **kwargs):
@@ -539,7 +559,6 @@ def generate_parallel_world(mode, output_dir):
     noise_functions = {
         'GBM_Gravity': apply_gbm_gravity_noise,
         'GARCH': apply_garch_noise,
-        'GARCH-Generate': apply_garch_generate_noise,
         'Anomaly_Injection': apply_anomaly_injection_noise
     }
     
