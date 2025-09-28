@@ -40,10 +40,10 @@ CUSTOM_PARAMETERS = {
         'recovery_hours': 36 # 恢复小时数
     },
     'Trend_Residual': {
-        'trend_halflife': 2880,   # 趋势平滑半衰期（小时）
+        'trend_halflife': 24,   # 趋势平滑半衰期（小时）
         'trend_scale': 1.0,     # 趋势强度缩放
         'sigma_scale': 1.0,     # 残差波动缩放
-        'sigma_max': 0.2,       # 残差波动最大值上限（每小时，log尺度）
+        'sigma_max': np.inf,       # 残差波动最大值上限（每小时，log尺度）
         'wick_scale': 1.0,      # 影线比例缩放（相对原始影线比例）
         'wick_noise_std': 0.1   # 影线噪声（乘性，均值为1附近）
     },
@@ -250,7 +250,7 @@ def apply_garch_noise(df, symbol=None, **kwargs):
 
 # Trend-Residual decomposition with GARCH residuals (no gravity)
 def apply_trend_residual_noise(df, symbol=None, **kwargs):
-    """Scheme C: Decompose log price into trend + residual, then
+    """Decompose log price into trend + residual, then
     model the residual increments with GARCH to obtain time-varying volatility,
     and recombine as: logP*_t = trend_scale * Trend_t + Residual*_t. No gravity.
 
